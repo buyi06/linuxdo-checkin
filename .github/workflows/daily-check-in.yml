@@ -41,14 +41,14 @@ jobs:
           POST_TARGET_MIN: "5"
           POST_TARGET_MAX: "8"
           # 每天浏览 50 个帖子
-          MAX_TOPICS: "50"
+          MAX_TOPICS: "100"
           # 滚动参数（单帖内部动作）。实际每帖总耗时由 POST_TARGET_* 兜底补齐。
           SCROLL_STEPS: "2"
           SCROLL_DELAY_MIN: "0.4"
           SCROLL_DELAY_MAX: "0.9"
           # 额外的“帖子间等待”设为 0，避免把每帖总耗时推到 POST_TARGET_MAX 之上
           TOPIC_DELAY_MIN: "0"
-          TOPIC_DELAY_MAX: "0"
+          TOPIC_DELAY_MAX: "1"
           # 连续失败时的退避（秒）
           BACKOFF_MIN: "6"
           BACKOFF_MAX: "12"
