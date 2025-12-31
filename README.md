@@ -1,8 +1,4 @@
-# LinuxDo 每日签到（每日打卡）
-
-## ~~不可用！~~
-
-~~**CF盾过不了，待事情有转机了再更新吧**~~
+# LinuxDo 每日浏览
 
 
 可以了,感谢 https://github.com/lexiforest/curl_cffi
