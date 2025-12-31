@@ -16,6 +16,35 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup
 
 
+def _env_bool(name: str, default: str = "false") -> bool:
+    """Parse common boolean env representations."""
+    return os.environ.get(name, default).strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+        "y",
+    )
+
+
+def _env_int(name: str, default: str) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: str) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+def _sleep_jitter(min_s: float, max_s: float) -> None:
+    time.sleep(random.uniform(min_s, max_s))
+
+
 def retry_decorator(retries=3):
     def decorator(func):
         @functools.wraps(func)
@@ -47,6 +76,28 @@ BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in
     "0",
     "off",
 ]
+
+# ===== 浏览任务参数（可在 GitHub Actions 里通过 env 直接设置） =====
+# 一次运行最多浏览多少个帖子
+MAX_TOPICS = max(0, _env_int("MAX_TOPICS", "50"))
+# 每个帖子滚动次数（越小越快；单帖总耗时由 POST_TARGET_* 兜底补齐）
+SCROLL_STEPS = max(0, _env_int("SCROLL_STEPS", "2"))
+# 每个帖子之间的等待（秒）。用于降低瞬时负载。
+TOPIC_DELAY_MIN = max(0.0, _env_float("TOPIC_DELAY_MIN", "0.4"))
+TOPIC_DELAY_MAX = max(TOPIC_DELAY_MIN, _env_float("TOPIC_DELAY_MAX", "1.0"))
+# 每次滚动之间的等待（秒）
+SCROLL_DELAY_MIN = max(0.0, _env_float("SCROLL_DELAY_MIN", "0.2"))
+SCROLL_DELAY_MAX = max(SCROLL_DELAY_MIN, _env_float("SCROLL_DELAY_MAX", "0.7"))
+# 连续失败时的退避（秒）
+BACKOFF_MIN = max(0.0, _env_float("BACKOFF_MIN", "3.0"))
+BACKOFF_MAX = max(BACKOFF_MIN, _env_float("BACKOFF_MAX", "6.0"))
+# 干跑模式：只浏览不做写操作（不点赞）
+DRY_RUN = _env_bool("DRY_RUN", "false")
+
+# 每帖目标停留时长（秒）：用于把“每帖浏览”节奏固定到一个区间（例如 5~8 秒）。
+# 说明：这里包含页面加载、滚动与等待；如果页面加载过慢，实际会高于上限。
+POST_TARGET_MIN = max(0.0, _env_float("POST_TARGET_MIN", "5"))
+POST_TARGET_MAX = max(POST_TARGET_MIN, _env_float("POST_TARGET_MAX", "8"))
 if not USERNAME:
     USERNAME = os.environ.get("USERNAME")
 if not PASSWORD:
@@ -59,6 +110,7 @@ HOME_URL = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
 SESSION_URL = "https://linux.do/session"
 CSRF_URL = "https://linux.do/session/csrf"
+LATEST_JSON_URL = "https://linux.do/latest.json"
 
 
 class LinuxDoBrowser:
@@ -91,6 +143,62 @@ class LinuxDoBrowser:
                 "Accept-Language": "zh-CN,zh;q=0.9",
             }
         )
+
+    def fetch_latest_topic_urls(self, limit: int) -> list:
+        """通过 Discourse 的 latest.json 拉取足量帖子链接。
+
+        这样可以突破首页 DOM 上可见主题数量的限制，满足一次运行浏览较多帖的需求。
+        """
+        if limit <= 0:
+            return []
+
+        headers = {
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": HOME_URL,
+        }
+
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        # 经验上每页几十条，最多翻 60 页，避免异常死循环
+        page = 0
+        while len(urls) < limit and page < 60:
+            resp = self.session.get(
+                f"{LATEST_JSON_URL}?page={page}",
+                headers=headers,
+                impersonate="chrome136",
+            )
+            if resp.status_code != 200:
+                logger.warning(f"拉取 latest.json 失败: page={page}, status={resp.status_code}")
+                break
+
+            try:
+                data = resp.json()
+            except Exception as e:
+                logger.warning(f"latest.json 解析失败: page={page}, err={e}")
+                break
+
+            topics = (data.get("topic_list") or {}).get("topics") or []
+            if not topics:
+                break
+
+            for t in topics:
+                tid = t.get("id")
+                slug = t.get("slug")
+                if not tid or not slug:
+                    continue
+                url = f"{HOME_URL}t/{slug}/{tid}"
+                if url in seen:
+                    continue
+                seen.add(url)
+                urls.append(url)
+                if len(urls) >= limit:
+                    break
+
+            page += 1
+
+        return urls
 
     def login(self):
         logger.info("开始登录")
@@ -189,35 +297,85 @@ class LinuxDoBrowser:
             return True
 
     def click_topic(self):
-        topic_list = self.page.ele("@id=list-area").eles(".:title")
-        if not topic_list:
-            logger.error("未找到主题帖")
-            return False
-        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择10个")
-        for topic in random.sample(topic_list, 10):
-            self.click_one_topic(topic.attr("href"))
+        if MAX_TOPICS <= 0:
+            logger.info("MAX_TOPICS=0，跳过浏览任务")
+            return True
+
+        # 先用 API 拉足量链接，满足一次浏览大量帖的需求；失败则回退到 DOM 抽取。
+        urls = []
+        try:
+            urls = self.fetch_latest_topic_urls(MAX_TOPICS)
+        except Exception as e:
+            logger.warning(f"拉取帖子链接异常，回退到页面抽取: {e}")
+
+        if not urls:
+            topic_list = self.page.ele("@id=list-area").eles(".:title")
+            if not topic_list:
+                logger.error("未找到主题帖")
+                return False
+            urls = [t.attr("href") for t in topic_list if t.attr("href")]
+
+        # 去重 + 打散
+        dedup = []
+        seen = set()
+        for u in urls:
+            if not u:
+                continue
+            if u in seen:
+                continue
+            seen.add(u)
+            dedup.append(u)
+
+        random.shuffle(dedup)
+        targets = dedup[: min(MAX_TOPICS, len(dedup))]
+
+        logger.info(f"本次计划浏览 {len(targets)} 个帖子")
+        for i, url in enumerate(targets, start=1):
+            ok = self.click_one_topic(url)
+            if not ok:
+                _sleep_jitter(BACKOFF_MIN, BACKOFF_MAX)
+            _sleep_jitter(TOPIC_DELAY_MIN, TOPIC_DELAY_MAX)
+            if i % 25 == 0:
+                logger.info(f"已完成 {i}/{len(targets)}")
+
         return True
 
     @retry_decorator()
     def click_one_topic(self, topic_url):
         new_page = self.browser.new_tab()
-        new_page.get(topic_url)
-        if random.random() < 0.3:  # 0.3 * 30 = 9
-            self.click_like(new_page)
-        self.browse_post(new_page)
-        new_page.close()
+        start_ts = time.time()
+        # 为每个帖子随机生成一个目标停留时长；用于保证“每帖 10~15 秒”这类需求。
+        target_s = random.uniform(POST_TARGET_MIN, POST_TARGET_MAX)
+        try:
+            new_page.get(topic_url)
+            # 点赞是写操作，允许通过 DRY_RUN 禁用。
+            if (not DRY_RUN) and random.random() < 0.3:
+                self.click_like(new_page)
+            self.browse_post(new_page)
+            # 兜底补齐：确保单帖整体耗时达到 target_s
+            elapsed = time.time() - start_ts
+            remain = target_s - elapsed
+            if remain > 0:
+                time.sleep(remain)
+            return True
+        finally:
+            try:
+                new_page.close()
+            except Exception:
+                pass
 
     def browse_post(self, page):
         prev_url = None
-        # 开始自动滚动，最多滚动10次
-        for _ in range(10):
+        # 开始自动滚动
+        for _ in range(SCROLL_STEPS):
             # 随机滚动一段距离
             scroll_distance = random.randint(550, 650)  # 随机滚动 550-650 像素
             logger.info(f"向下滚动 {scroll_distance} 像素...")
             page.run_js(f"window.scrollBy(0, {scroll_distance})")
             logger.info(f"已加载页面: {page.url}")
 
-            if random.random() < 0.03:  # 33 * 4 = 132
+            # 小概率提前退出，避免每帖行为完全一致
+            if random.random() < 0.01:
                 logger.success("随机退出浏览")
                 break
 
@@ -232,9 +390,8 @@ class LinuxDoBrowser:
                 logger.success("已到达页面底部，退出浏览")
                 break
 
-            # 动态随机等待
-            wait_time = random.uniform(2, 4)  # 随机等待 2-4 秒
-            logger.info(f"等待 {wait_time:.2f} 秒...")
+            # 动态随机等待（可配置）
+            wait_time = random.uniform(SCROLL_DELAY_MIN, SCROLL_DELAY_MAX)
             time.sleep(wait_time)
 
     def run(self):
@@ -255,17 +412,26 @@ class LinuxDoBrowser:
 
     def click_like(self, page):
         try:
-            # 专门查找未点赞的按钮
-            like_button = page.ele(".discourse-reactions-reaction-button")
+            if DRY_RUN:
+                logger.info("DRY_RUN 启用，跳过点赞")
+                return False
+
+            # 尽量只点“未点赞”的按钮（样式/插件差异时仍可能回退到普通选择器）
+            like_button = page.ele(
+                ".discourse-reactions-reaction-button:not(.reacted)"
+            ) or page.ele(".discourse-reactions-reaction-button")
             if like_button:
                 logger.info("找到未点赞的帖子，准备点赞")
                 like_button.click()
                 logger.info("点赞成功")
-                time.sleep(random.uniform(1, 2))
+                _sleep_jitter(0.8, 1.6)
+                return True
             else:
                 logger.info("帖子可能已经点过赞了")
+                return False
         except Exception as e:
             logger.error(f"点赞失败: {str(e)}")
+            return False
 
     def print_connect_info(self):
         logger.info("获取连接信息")
